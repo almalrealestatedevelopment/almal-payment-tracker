@@ -1,0 +1,8 @@
+{
+  "name": "almal-payment-tracker",
+  "version": "1.0.0",
+  "description": "The One Bali payment automation — HubSpot webhook handler",
+  "dependencies": {
+    "@hubspot/api-client": "^11.0.0"
+  }
+}
