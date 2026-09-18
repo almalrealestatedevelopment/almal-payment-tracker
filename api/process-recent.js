@@ -126,6 +126,42 @@ async function updateDealStatus(client, dealId, planType, newStage) {
   }
 }
 
+async function updatePaymentHealthStatus(client, dealId) {
+  if (!dealId) return;
+  try {
+    const assocs = await assocGet(client, 'deals', dealId, PLAN_OBJ);
+    const planIds = assocs.map(a => String(a.toObjectId));
+    if (!planIds.length) return;
+
+    const batchResp = await client.crm.objects.batchApi.read(PLAN_OBJ, {
+      inputs: planIds.map(id => ({ id })),
+      properties: ['installment_sequence', 'hs_pipeline_stage', 'amount_due'],
+    });
+    const plans = (batchResp.results || [])
+      .filter(p => num(p.properties.amount_due) > 0);
+    if (!plans.length) return;
+
+    const hasOverdue = plans.some(p => p.properties.hs_pipeline_stage === STAGES.OVERDUE);
+    const sortedBySeq = [...plans].sort((a, b) =>
+      num(b.properties.installment_sequence) - num(a.properties.installment_sequence));
+    const lastPlanStage = sortedBySeq[0].properties.hs_pipeline_stage;
+    const fullyPaid = lastPlanStage === STAGES.PAID || lastPlanStage === STAGES.FULL_PAYMENT;
+
+    let healthStatus;
+    if (hasOverdue)       healthStatus = 'Overdue - Follow Up';
+    else if (fullyPaid)   healthStatus = 'Fully Paid';
+    else                  healthStatus = 'On Track';
+
+    console.log(`[updatePaymentHealthStatus] deal ${dealId}: payment_health_status="${healthStatus}"`);
+    await client.crm.deals.basicApi.update(dealId, {
+      properties: { payment_health_status: healthStatus },
+    });
+    console.log(`[updatePaymentHealthStatus] Success`);
+  } catch (err) {
+    console.log(`[updatePaymentHealthStatus] ERROR: ${err.message}`);
+  }
+}
+
 async function processPaymentPlan(client, planId, carryOver) {
   const planResp = await client.crm.objects.basicApi.getById(PLAN_OBJ, planId, [
     'amount_due', 'total_payments_received', 'carried_over_amount',
@@ -158,6 +194,7 @@ async function processPaymentPlan(client, planId, carryOver) {
   const dealAssocs = await assocGet(client, PLAN_OBJ, planId, 'deals');
   const dealId = dealAssocs[0] ? String(dealAssocs[0].toObjectId) : null;
   await updateDealStatus(client, dealId, props.payment_type, newStage);
+  await updatePaymentHealthStatus(client, dealId);
 
   if (overflow > 0 && dealId) {
     const seq = num(props.installment_sequence);
