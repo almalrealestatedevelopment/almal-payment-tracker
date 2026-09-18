@@ -5,11 +5,11 @@ const STAGES = {
   OVERDUE: '5894912201', OVERPAID: '5894912202', FULL_PAYMENT: '5894912203',
 };
 const DEAL_STATUS_MAP = {
-  'booking_fee':   { paid: 'Booking Fee Paid',   partial: null },
-  'downpayment':   { paid: 'Downpayment Paid',   partial: 'Downpayment Partial' },
-  'installment_1': { paid: 'Installment 1 Paid', partial: 'Installment 1 Partial' },
-  'installment_2': { paid: 'Installment 2 Paid', partial: 'Installment 2 Partial' },
-  'installment_3': { paid: 'Installment 3 Paid', partial: 'Installment 3 Partial' },
+  'Booking Fee':   { paid: 'Booking Fee Paid',   partial: null },
+  'Downpayment':   { paid: 'Downpayment Paid',   partial: 'Downpayment Partial' },
+  'Installment 1': { paid: 'Installment 1 Paid', partial: 'Installment 1 Partial' },
+  'Installment 2': { paid: 'Installment 2 Paid', partial: 'Installment 2 Partial' },
+  'Installment 3': { paid: 'Installment 3 Paid', partial: 'Installment 3 Partial' },
   'Installment 4': { paid: 'Installment 4 Paid', partial: 'Installment 4 Partial' },
   'Installment 5': { paid: 'Installment 5 Paid', partial: 'Installment 5 Partial' },
   'Installment 6': { paid: 'Installment 6 Paid', partial: 'Installment 6 Partial' },
@@ -60,7 +60,7 @@ async function updateDealStatus(client, dealId, planType, isPaid, isPartial) {
 async function processPaymentPlan(client, planId, carryOver) {
   const planResp = await client.crm.objects.basicApi.getById(PLAN_OBJ, planId, [
     'amount_due', 'total_payments_received', 'carried_over_amount',
-    'installment_sequence', 'payment_plan_type', 'hs_pipeline_stage',
+    'installment_sequence', 'payment_type', 'hs_pipeline_stage',
   ]);
   const props = planResp.properties;
   const amountDue = num(props.amount_due);
@@ -90,7 +90,7 @@ async function processPaymentPlan(client, planId, carryOver) {
   const isPartial = newStage === STAGES.PARTIALLY_PAID;
   const dealAssocs = await assocGet(client, PLAN_OBJ, planId, 'deals');
   const dealId = dealAssocs[0] ? String(dealAssocs[0].toObjectId) : null;
-  await updateDealStatus(client, dealId, props.payment_plan_type, isPaid, isPartial);
+  await updateDealStatus(client, dealId, props.payment_type, isPaid, isPartial);
 
   if (overflow > 0 && dealId) {
     const seq = num(props.installment_sequence);
