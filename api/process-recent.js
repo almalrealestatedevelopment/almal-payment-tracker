@@ -162,7 +162,12 @@ async function updatePaymentHealthStatus(client, dealId) {
   }
 }
 
-async function processPaymentPlan(client, planId, carryOver) {
+// processedPlans: avoids re-processing the same plan multiple times in one run
+// healthStatusDone: avoids calling updatePaymentHealthStatus more than once per deal per run
+async function processPaymentPlan(client, planId, carryOver, processedPlans, healthStatusDone) {
+  if (processedPlans.has(planId)) return;
+  processedPlans.add(planId);
+
   const planResp = await client.crm.objects.basicApi.getById(PLAN_OBJ, planId, [
     'amount_due', 'total_payments_received', 'carried_over_amount',
     'installment_sequence', 'payment_type', 'hs_pipeline_stage',
@@ -194,12 +199,17 @@ async function processPaymentPlan(client, planId, carryOver) {
   const dealAssocs = await assocGet(client, PLAN_OBJ, planId, 'deals');
   const dealId = dealAssocs[0] ? String(dealAssocs[0].toObjectId) : null;
   await updateDealStatus(client, dealId, props.payment_type, newStage);
-  await updatePaymentHealthStatus(client, dealId);
+
+  // Only call updatePaymentHealthStatus once per deal per run
+  if (dealId && !healthStatusDone.has(dealId)) {
+    healthStatusDone.add(dealId);
+    await updatePaymentHealthStatus(client, dealId);
+  }
 
   if (overflow > 0 && dealId) {
     const seq = num(props.installment_sequence);
     const nextPlan = await findNextPlan(client, planId, seq, dealId);
-    if (nextPlan) await processPaymentPlan(client, nextPlan.id, overflow);
+    if (nextPlan) await processPaymentPlan(client, nextPlan.id, overflow, processedPlans, healthStatusDone);
   }
 }
 
@@ -221,13 +231,17 @@ module.exports = async function handler(req, res) {
 
   if (!ids.length) return res.status(200).json({ status: 'nothing_recent' });
 
+  // Shared across all transactions in this run to avoid redundant API calls
+  const processedPlans  = new Set();
+  const healthStatusDone = new Set();
+
   const results = [];
   for (const transactionId of ids) {
     try {
       const planAssoc = await assocGet(client, TXN_OBJ, transactionId, PLAN_OBJ);
       if (!planAssoc.length) { results.push({ transactionId, status: 'no_plan' }); continue; }
       const planId = String(planAssoc[0].toObjectId);
-      await processPaymentPlan(client, planId, null);
+      await processPaymentPlan(client, planId, null, processedPlans, healthStatusDone);
       results.push({ transactionId, status: 'success' });
     } catch (err) {
       results.push({ transactionId, status: 'error', error: err.message });
