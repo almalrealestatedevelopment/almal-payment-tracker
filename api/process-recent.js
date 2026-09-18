@@ -5,7 +5,7 @@ const STAGES = {
   OVERDUE: '5894912201', OVERPAID: '5894912202', FULL_PAYMENT: '5894912203',
 };
 
-// Maps payment_type → { paid, partial } values written to deal's payment_health_status property
+// Maps payment_type → { paid, partial } values written to deal's payment_status property
 const DEAL_STATUS_MAP = {
   'booking fee':   { paid: 'Booking Fee Paid',   partial: null },
   'booking_fee':   { paid: 'Booking Fee Paid',   partial: null },
@@ -57,6 +57,53 @@ const STAGE_LABELS = {
   '5894912203': 'Full Payment',
 };
 
+// ── The One Bali_Sales Pipeline deal-stage advancement ──────────────────────
+const BALI_PIPELINE_ID = '3452722368';
+
+// Maps payment_type (when fully paid) → deal stage ID to advance to
+const PAYMENT_TYPE_TO_BALI_STAGE = {
+  'booking fee':   '4726290672', // Booking Fee
+  'booking_fee':   '4726290672',
+  'downpayment':   '5831054552', // Downpayment
+  'installment 1': '5831054553', // 1st Installment
+  'installment_1': '5831054553',
+  'installment 2': '5831054554', // 2nd Installment
+  'installment_2': '5831054554',
+  'installment 3': '5831054555', // 3rd Installment
+  'installment_3': '5831054555',
+  'installment 4': '5831054556', // 4th Installment
+  'installment_4': '5831054556',
+  'installment 5': '5831054557', // 5th Installment
+  'installment_5': '5831054557',
+  'installment 6': '5831054558', // 6th Installment
+  'installment_6': '5831054558',
+  'installment 7': '5898731716', // 7th Installment
+  'installment_7': '5898731716',
+  'full payment':  '4726290674', // Fully Paid
+};
+
+// Ordered progression — used to ensure we only move forward, never backward
+const BALI_STAGE_ORDER = [
+  'appointmentscheduled', // Qualified Lead
+  'qualifiedtobuy',       // Offer Sent
+  '4726290671',           // Offer Preparation
+  'decisionmakerboughtin',// Negotiation
+  'closedwon',            // Booked / Closed Deal
+  '4726290672',           // Booking Fee
+  '4726290673',           // Sublease Agreement (manual — not payment-triggered)
+  '5831054552',           // Downpayment
+  '5831054553',           // 1st Installment
+  '5831054554',           // 2nd Installment
+  '5831054555',           // 3rd Installment
+  '5831054556',           // 4th Installment
+  '5831054557',           // 5th Installment
+  '5831054558',           // 6th Installment
+  '5898731716',           // 7th Installment
+  '4726290674',           // Fully Paid
+  '5898730710',           // Handover
+];
+// ────────────────────────────────────────────────────────────────────────────
+
 const PLAN_OBJ = 'p146428886_payment_plans';
 const TXN_OBJ  = 'p146428886_payment_transactions';
 
@@ -99,7 +146,7 @@ async function updateDealStatus(client, dealId, planType, newStage) {
   const isPaid    = newStage === STAGES.PAID || newStage === STAGES.FULL_PAYMENT;
   const isPartial = newStage === STAGES.PARTIALLY_PAID;
 
-  // payment_health_status — the summary field shown on the deal card header
+  // payment_status — free-text field shown on the deal card
   let healthStatus = null;
   if (isPaid) healthStatus = map.paid;
   else if (isPartial && map.partial) healthStatus = map.partial;
@@ -109,8 +156,6 @@ async function updateDealStatus(client, dealId, planType, newStage) {
   const dealProp   = PAYMENT_TYPE_TO_DEAL_PROP[key];
   const stageLabel = STAGE_LABELS[newStage] || '';
 
-  // payment_status = free-text field with detailed status like "Downpayment Partial"
-  // payment_health_status = restricted dropdown ("On Track" / "Overdue - Follow Up" / "Fully Paid") — handled separately
   const updateProps = { payment_status: healthStatus };
   if (dealProp && stageLabel) updateProps[dealProp] = stageLabel;
 
@@ -162,6 +207,45 @@ async function updatePaymentHealthStatus(client, dealId) {
   }
 }
 
+// Advances the deal stage in The One Bali_Sales Pipeline when a plan is fully paid.
+// Only moves forward — never demotes the stage.
+async function advanceDealStage(client, dealId, planType, newStage) {
+  if (!dealId) return;
+
+  // Only fire on fully paid plans
+  const isPaid = newStage === STAGES.PAID || newStage === STAGES.FULL_PAYMENT;
+  if (!isPaid) return;
+
+  const key = (planType || '').toLowerCase();
+  const targetStageId = PAYMENT_TYPE_TO_BALI_STAGE[key];
+  if (!targetStageId) return;
+
+  try {
+    // Fetch the deal's current pipeline and stage
+    const dealResp = await client.crm.deals.basicApi.getById(dealId, ['pipeline', 'dealstage']);
+    const dealProps = dealResp.properties;
+
+    // Only applies to The One Bali_Sales Pipeline
+    if (dealProps.pipeline !== BALI_PIPELINE_ID) return;
+
+    const currentIdx = BALI_STAGE_ORDER.indexOf(dealProps.dealstage);
+    const targetIdx  = BALI_STAGE_ORDER.indexOf(targetStageId);
+
+    if (targetIdx <= currentIdx) {
+      console.log(`[advanceDealStage] deal ${dealId}: already at or past stage "${targetStageId}", skipping`);
+      return;
+    }
+
+    console.log(`[advanceDealStage] deal ${dealId}: ${dealProps.dealstage} → "${targetStageId}"`);
+    await client.crm.deals.basicApi.update(dealId, {
+      properties: { dealstage: targetStageId },
+    });
+    console.log(`[advanceDealStage] Success`);
+  } catch (err) {
+    console.log(`[advanceDealStage] ERROR: ${err.message}`);
+  }
+}
+
 // processedPlans: avoids re-processing the same plan multiple times in one run
 // healthStatusDone: avoids calling updatePaymentHealthStatus more than once per deal per run
 async function processPaymentPlan(client, planId, carryOver, processedPlans, healthStatusDone) {
@@ -198,7 +282,9 @@ async function processPaymentPlan(client, planId, carryOver, processedPlans, hea
 
   const dealAssocs = await assocGet(client, PLAN_OBJ, planId, 'deals');
   const dealId = dealAssocs[0] ? String(dealAssocs[0].toObjectId) : null;
+
   await updateDealStatus(client, dealId, props.payment_type, newStage);
+  await advanceDealStage(client, dealId, props.payment_type, newStage);
 
   // Only call updatePaymentHealthStatus once per deal per run
   if (dealId && !healthStatusDone.has(dealId)) {
