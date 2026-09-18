@@ -5,16 +5,16 @@ const STAGES = {
   OVERDUE: '5894912201', OVERPAID: '5894912202', FULL_PAYMENT: '5894912203',
 };
 const DEAL_STATUS_MAP = {
-  'Booking Fee':   { paid: 'Booking Fee Paid',   partial: null },
-  'Downpayment':   { paid: 'Downpayment Paid',   partial: 'Downpayment Partial' },
-  'Installment 1': { paid: 'Installment 1 Paid', partial: 'Installment 1 Partial' },
-  'Installment 2': { paid: 'Installment 2 Paid', partial: 'Installment 2 Partial' },
-  'Installment 3': { paid: 'Installment 3 Paid', partial: 'Installment 3 Partial' },
-  'Installment 4': { paid: 'Installment 4 Paid', partial: 'Installment 4 Partial' },
-  'Installment 5': { paid: 'Installment 5 Paid', partial: 'Installment 5 Partial' },
-  'Installment 6': { paid: 'Installment 6 Paid', partial: 'Installment 6 Partial' },
-  'Installment 7': { paid: 'Installment 7 Paid', partial: 'Installment 7 Partial' },
-  'Full Payment':  { paid: 'Full Payment',        partial: null },
+  'booking fee':   { paid: 'Booking Fee Paid',   partial: null },
+  'downpayment':   { paid: 'Downpayment Paid',   partial: 'Downpayment Partial' },
+  'installment 1': { paid: 'Installment 1 Paid', partial: 'Installment 1 Partial' },
+  'installment 2': { paid: 'Installment 2 Paid', partial: 'Installment 2 Partial' },
+  'installment 3': { paid: 'Installment 3 Paid', partial: 'Installment 3 Partial' },
+  'installment 4': { paid: 'Installment 4 Paid', partial: 'Installment 4 Partial' },
+  'installment 5': { paid: 'Installment 5 Paid', partial: 'Installment 5 Partial' },
+  'installment 6': { paid: 'Installment 6 Paid', partial: 'Installment 6 Partial' },
+  'installment 7': { paid: 'Installment 7 Paid', partial: 'Installment 7 Partial' },
+  'full payment':  { paid: 'Full Payment',        partial: null },
 };
 const PLAN_OBJ = 'p146428886_payment_plans';
 const TXN_OBJ  = 'p146428886_payment_transactions';
@@ -48,13 +48,22 @@ async function findNextPlan(client, currentPlanId, currentSeq, dealId) {
 
 async function updateDealStatus(client, dealId, planType, isPaid, isPartial) {
   if (!dealId) return;
-  const map = DEAL_STATUS_MAP[planType];
-  if (!map) return;
+  const map = DEAL_STATUS_MAP[(planType || '').toLowerCase()];
+  if (!map) {
+    console.log(`[updateDealStatus] No map entry for planType: "${planType}"`);
+    return;
+  }
   let status = null;
   if (isPaid) status = map.paid;
   else if (isPartial && map.partial) status = map.partial;
   if (!status) return;
-  await client.crm.deals.basicApi.update(dealId, { properties: { payment_status: status } });
+  console.log(`[updateDealStatus] Setting deal ${dealId} payment_status = "${status}"`);
+  try {
+    await client.crm.deals.basicApi.update(dealId, { properties: { payment_status: status } });
+    console.log(`[updateDealStatus] Success`);
+  } catch (err) {
+    console.log(`[updateDealStatus] ERROR: ${err.message}`);
+  }
 }
 
 async function processPaymentPlan(client, planId, carryOver) {
