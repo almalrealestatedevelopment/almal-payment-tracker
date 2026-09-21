@@ -272,8 +272,11 @@ async function processPaymentPlan(client, planId, carryOver, processedPlans, hea
   else if (amountPaid > 0)     newStage = STAGES.PARTIALLY_PAID;
   else                          newStage = STAGES.UNPAID;
 
+  const balanceDue = round(Math.max(0, amountDue - amountPaid));
+
   const updateProps = {
     amount_paid: String(amountPaid),
+    balance_due: String(balanceDue),
     hs_pipeline_stage: newStage,
   };
   if (carryOver !== null) updateProps.carried_over_amount = String(effectiveCarry);
