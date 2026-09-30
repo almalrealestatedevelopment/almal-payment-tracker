@@ -1,341 +1,317 @@
+// ============================================================
+// ALMAL – The One Bali Nusa Dua — Payment Tracker (deal-level cascade)
+//
+// Called by the 30-minute cron (GET) and by the HubSpot webhook (POST,
+// via api/process-payment.js). For every Bali deal it recalculates
+// from scratch — nothing accumulates, so re-running is always safe:
+//
+//   1. Schedule = the deal's Payment Management records
+//      (Downpayment, Installment 1..7, Full Payment). Booking Fee
+//      records are NOT schedule lines — a booking fee is just a payment.
+//      If Amount Due is empty but "% of Purchase Price" is set, Amount Due
+//      is filled from Unit Total Lease Price USD: instalments = % x price
+//      rounded down to whole dollars, Downpayment = price minus the rest,
+//      so the schedule always totals the price exactly.
+//   2. Money = ALL Payment Transactions linked to any of the deal's plans.
+//   3. Cascade: Downpayment first, then Installment 1, 2, ... each takes
+//      what it needs before the next gets anything.
+//   4. Writes Amount Paid, Balance Due, stage + Payment Status on each plan
+//      (HubSpot workflows then copy them to the deal) and the deal's
+//      Payment Health Status, payment_status and deal stage (forward only).
+//
+// All money is handled in integer cents — never rounded.
+//
+//   GET  /api/process-recent                 run all Bali deals (cron)
+//   GET  /api/process-recent?deal=ID&dry=1   preview (needs CRON_SECRET)
+//   POST /api/process-recent                 HubSpot webhook events
+//
+// ENV: HUBSPOT_PRIVATE_APP_TOKEN (existing). Optional CRON_SECRET for previews.
+// ============================================================
+
 const hubspot = require('@hubspot/api-client');
+
+const PLAN_OBJ = 'p146428886_payment_plans';
+const TXN_OBJ = 'p146428886_payment_transactions';
+const BALI_DEAL_PIPELINE = '3452722368';
+const PLAN_PIPELINE = '4042897641';
+const SKIP_DEALS = ['B-G08', 'B-110', 'B-G04']; // team test units — never touched
 
 const STAGES = {
   UNPAID: '5894899923', PARTIALLY_PAID: '5894912200', PAID: '5894899922',
   OVERDUE: '5894912201', OVERPAID: '5894912202', FULL_PAYMENT: '5894912203',
 };
-
-// Maps payment_type → { paid, partial } values written to deal's payment_status property
-const DEAL_STATUS_MAP = {
-  'booking fee':   { paid: 'Booking Fee Paid',   partial: null },
-  'booking_fee':   { paid: 'Booking Fee Paid',   partial: null },
-  'downpayment':   { paid: 'Downpayment Paid',   partial: 'Downpayment Partial' },
-  'installment 1': { paid: 'Installment 1 Paid', partial: 'Installment 1 Partial' },
-  'installment 2': { paid: 'Installment 2 Paid', partial: 'Installment 2 Partial' },
-  'installment 3': { paid: 'Installment 3 Paid', partial: 'Installment 3 Partial' },
-  'installment 4': { paid: 'Installment 4 Paid', partial: 'Installment 4 Partial' },
-  'installment 5': { paid: 'Installment 5 Paid', partial: 'Installment 5 Partial' },
-  'installment 6': { paid: 'Installment 6 Paid', partial: 'Installment 6 Partial' },
-  'installment 7': { paid: 'Installment 7 Paid', partial: 'Installment 7 Partial' },
-  'installment_1': { paid: 'Installment 1 Paid', partial: 'Installment 1 Partial' },
-  'installment_2': { paid: 'Installment 2 Paid', partial: 'Installment 2 Partial' },
-  'installment_3': { paid: 'Installment 3 Paid', partial: 'Installment 3 Partial' },
-  'installment_4': { paid: 'Installment 4 Paid', partial: 'Installment 4 Partial' },
-  'installment_5': { paid: 'Installment 5 Paid', partial: 'Installment 5 Partial' },
-  'installment_6': { paid: 'Installment 6 Paid', partial: 'Installment 6 Partial' },
-  'installment_7': { paid: 'Installment 7 Paid', partial: 'Installment 7 Partial' },
-  'full payment':  { paid: 'Full Payment',        partial: null },
+const STAGE_LABEL = {
+  [STAGES.UNPAID]: 'Unpaid', [STAGES.PARTIALLY_PAID]: 'Partially Paid',
+  [STAGES.PAID]: 'Paid', [STAGES.OVERDUE]: 'Overdue',
+  [STAGES.OVERPAID]: 'Overpaid', [STAGES.FULL_PAYMENT]: 'Full Payment',
 };
+const PAID_STAGES = [STAGES.PAID, STAGES.FULL_PAYMENT, STAGES.OVERPAID];
 
-// Maps payment_type → deal property that drives the Installment Status card badge
-const PAYMENT_TYPE_TO_DEAL_PROP = {
-  'downpayment':   'downpayment',
-  'installment 1': 'installment_1',
-  'installment 2': 'installment_2',
-  'installment 3': 'installment_3',
-  'installment 4': 'installment_4',
-  'installment 5': 'installment_5',
-  'installment 6': 'installment_6',
-  'installment 7': 'installment_7',
-  'installment_1': 'installment_1',
-  'installment_2': 'installment_2',
-  'installment_3': 'installment_3',
-  'installment_4': 'installment_4',
-  'installment_5': 'installment_5',
-  'installment_6': 'installment_6',
-  'installment_7': 'installment_7',
-  'full payment':  'installment_7',
+// seq -> labels / deal stage (The One Bali_Sales Pipeline)
+const SEQ_NAME = s => (s === 1 ? 'Downpayment' : s === 99 ? 'Full Payment' : `Installment ${s - 1}`);
+const SEQ_TO_DEAL_STAGE = {
+  1: '5831054552', 2: '5831054553', 3: '5831054554', 4: '5831054555', 5: '5831054556',
+  6: '5831054557', 7: '5831054558', 8: '5898731716', 99: '4726290674',
 };
-
-// Stage ID → label written to the deal's per-installment badge property
-const STAGE_LABELS = {
-  '5894899923': 'Unpaid',
-  '5894912200': 'Partially Paid',
-  '5894899922': 'Paid',
-  '5894912201': 'Overdue',
-  '5894912202': 'Overpaid',
-  '5894912203': 'Full Payment',
-};
-
-// ── The One Bali_Sales Pipeline deal-stage advancement ──────────────────────
-const BALI_PIPELINE_ID = '3452722368';
-
-// Maps payment_type (when fully paid) → deal stage ID to advance to
-const PAYMENT_TYPE_TO_BALI_STAGE = {
-  'booking fee':   '4726290672', // Booking Fee
-  'booking_fee':   '4726290672',
-  'downpayment':   '5831054552', // Downpayment
-  'installment 1': '5831054553', // 1st Installment
-  'installment_1': '5831054553',
-  'installment 2': '5831054554', // 2nd Installment
-  'installment_2': '5831054554',
-  'installment 3': '5831054555', // 3rd Installment
-  'installment_3': '5831054555',
-  'installment 4': '5831054556', // 4th Installment
-  'installment_4': '5831054556',
-  'installment 5': '5831054557', // 5th Installment
-  'installment_5': '5831054557',
-  'installment 6': '5831054558', // 6th Installment
-  'installment_6': '5831054558',
-  'installment 7': '5898731716', // 7th Installment
-  'installment_7': '5898731716',
-  'full payment':  '4726290674', // Fully Paid
-};
-
-// Ordered progression — used to ensure we only move forward, never backward
 const BALI_STAGE_ORDER = [
-  'appointmentscheduled', // Qualified Lead
-  'qualifiedtobuy',       // Offer Sent
-  '4726290671',           // Offer Preparation
-  'decisionmakerboughtin',// Negotiation
-  'closedwon',            // Booked / Closed Deal
-  '4726290672',           // Booking Fee
-  '4726290673',           // Sublease Agreement (manual — not payment-triggered)
-  '5831054552',           // Downpayment
-  '5831054553',           // 1st Installment
-  '5831054554',           // 2nd Installment
-  '5831054555',           // 3rd Installment
-  '5831054556',           // 4th Installment
-  '5831054557',           // 5th Installment
-  '5831054558',           // 6th Installment
-  '5898731716',           // 7th Installment
-  '4726290674',           // Fully Paid
-  '5898730710',           // Handover
+  'appointmentscheduled', 'qualifiedtobuy', '4726290671', 'decisionmakerboughtin', 'closedwon',
+  '4726290672', '4726290673', '5831054552', '5831054553', '5831054554', '5831054555',
+  '5831054556', '5831054557', '5831054558', '5898731716', '4726290674', '5898730710',
 ];
-// ────────────────────────────────────────────────────────────────────────────
 
-const PLAN_OBJ = 'p146428886_payment_plans';
-const TXN_OBJ  = 'p146428886_payment_transactions';
-
-function num(v) { return parseFloat(v) || 0; }
-function round(v) { return Math.round(v * 100) / 100; }
-
-async function assocGet(client, fromType, fromId, toType) {
-  const r = await client.apiRequest({
-    method: 'GET',
-    path: `/crm/v4/objects/${fromType}/${fromId}/associations/${toType}`,
-  });
-  const b = await r.json();
-  return b.results || [];
+// ── money: integer cents ──
+function toCents(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const s = String(v).trim().replace(/,/g, '');
+  if (!/^-?\d+(\.\d+)?$/.test(s)) return null;
+  const neg = s.startsWith('-');
+  const [w, f = ''] = s.replace('-', '').split('.');
+  const c = Number(w) * 100 + Number((f + '00').slice(0, 2));
+  return neg ? -c : c;
+}
+function fromCents(c) {
+  const neg = c < 0; c = Math.abs(c);
+  const w = Math.floor(c / 100), f = c % 100;
+  return (neg ? '-' : '') + (f ? `${w}.${String(f).padStart(2, '0')}` : String(w));
 }
 
-async function findNextPlan(client, currentPlanId, currentSeq, dealId) {
-  const assocs = await assocGet(client, 'deals', dealId, PLAN_OBJ);
-  const planIds = assocs.map(a => String(a.toObjectId)).filter(id => id !== String(currentPlanId));
-  if (!planIds.length) return null;
-  const batchResp = await client.crm.objects.batchApi.read(PLAN_OBJ, {
-    inputs: planIds.map(id => ({ id })),
-    properties: ['installment_sequence', 'amount_due', 'carried_over_amount'],
-  });
-  const plans = batchResp.results || [];
-  const next = plans
-    .filter(p => num(p.properties.installment_sequence) === currentSeq + 1)
-    .sort((a, b) => num(a.properties.installment_sequence) - num(b.properties.installment_sequence))[0];
-  return next || null;
+function sequenceOf(type) {
+  const t = (type || '').toLowerCase();
+  if (t.includes('booking')) return null;
+  if (t.includes('down')) return 1;
+  if (t.includes('full')) return 99;
+  const m = t.match(/(\d+)/);
+  return m ? 1 + parseInt(m[1], 10) : null;
 }
 
-async function updateDealStatus(client, dealId, planType, newStage) {
-  if (!dealId) return;
-  const key = (planType || '').toLowerCase();
-  const map = DEAL_STATUS_MAP[key];
-  if (!map) {
-    console.log(`[updateDealStatus] No map entry for planType: "${planType}"`);
-    return;
-  }
+// ── pure calculation ──
+function computeDeal({ priceCents, plans, txnCents, today }) {
+  const lines = plans
+    .map(p => ({ ...p, seq: sequenceOf(p.payment_type) }))
+    .filter(p => p.seq !== null)
+    .sort((a, b) => a.seq - b.seq);
 
-  const isPaid    = newStage === STAGES.PAID || newStage === STAGES.FULL_PAYMENT;
-  const isPartial = newStage === STAGES.PARTIALLY_PAID;
-
-  // payment_status — free-text field shown on the deal card
-  let healthStatus = null;
-  if (isPaid) healthStatus = map.paid;
-  else if (isPartial && map.partial) healthStatus = map.partial;
-  if (!healthStatus) return;
-
-  // individual badge property — drives the Installment Status grid on the deal card
-  const dealProp   = PAYMENT_TYPE_TO_DEAL_PROP[key];
-  const stageLabel = STAGE_LABELS[newStage] || '';
-
-  const updateProps = { payment_status: healthStatus };
-  if (dealProp && stageLabel) updateProps[dealProp] = stageLabel;
-
-  console.log(
-    `[updateDealStatus] deal ${dealId}: payment_status="${healthStatus}"` +
-    (dealProp ? `, ${dealProp}="${stageLabel}"` : '')
-  );
-  try {
-    await client.crm.deals.basicApi.update(dealId, { properties: updateProps });
-    console.log(`[updateDealStatus] Success`);
-  } catch (err) {
-    console.log(`[updateDealStatus] ERROR: ${err.message}`);
-  }
-}
-
-async function updatePaymentHealthStatus(client, dealId) {
-  if (!dealId) return;
-  try {
-    const assocs = await assocGet(client, 'deals', dealId, PLAN_OBJ);
-    const planIds = assocs.map(a => String(a.toObjectId));
-    if (!planIds.length) return;
-
-    const batchResp = await client.crm.objects.batchApi.read(PLAN_OBJ, {
-      inputs: planIds.map(id => ({ id })),
-      properties: ['installment_sequence', 'hs_pipeline_stage', 'amount_due'],
-    });
-    const plans = (batchResp.results || [])
-      .filter(p => num(p.properties.amount_due) > 0);
-    if (!plans.length) return;
-
-    const hasOverdue = plans.some(p => p.properties.hs_pipeline_stage === STAGES.OVERDUE);
-    const sortedBySeq = [...plans].sort((a, b) =>
-      num(b.properties.installment_sequence) - num(a.properties.installment_sequence));
-    const lastPlanStage = sortedBySeq[0].properties.hs_pipeline_stage;
-    const fullyPaid = lastPlanStage === STAGES.PAID || lastPlanStage === STAGES.FULL_PAYMENT;
-
-    let healthStatus;
-    if (hasOverdue)       healthStatus = 'Overdue - Follow Up';
-    else if (fullyPaid)   healthStatus = 'Fully Paid';
-    else                  healthStatus = 'On Track';
-
-    console.log(`[updatePaymentHealthStatus] deal ${dealId}: payment_health_status="${healthStatus}"`);
-    await client.crm.deals.basicApi.update(dealId, {
-      properties: { payment_health_status: healthStatus },
-    });
-    console.log(`[updatePaymentHealthStatus] Success`);
-  } catch (err) {
-    console.log(`[updatePaymentHealthStatus] ERROR: ${err.message}`);
-  }
-}
-
-// Advances the deal stage in The One Bali_Sales Pipeline when a plan is fully paid.
-// Only moves forward — never demotes the stage.
-async function advanceDealStage(client, dealId, planType, newStage) {
-  if (!dealId) return;
-
-  // Only fire on fully paid plans
-  const isPaid = newStage === STAGES.PAID || newStage === STAGES.FULL_PAYMENT;
-  if (!isPaid) return;
-
-  const key = (planType || '').toLowerCase();
-  const targetStageId = PAYMENT_TYPE_TO_BALI_STAGE[key];
-  if (!targetStageId) return;
-
-  try {
-    // Fetch the deal's current pipeline and stage
-    const dealResp = await client.crm.deals.basicApi.getById(dealId, ['pipeline', 'dealstage']);
-    const dealProps = dealResp.properties;
-
-    // Only applies to The One Bali_Sales Pipeline
-    if (dealProps.pipeline !== BALI_PIPELINE_ID) return;
-
-    const currentIdx = BALI_STAGE_ORDER.indexOf(dealProps.dealstage);
-    const targetIdx  = BALI_STAGE_ORDER.indexOf(targetStageId);
-
-    if (targetIdx <= currentIdx) {
-      console.log(`[advanceDealStage] deal ${dealId}: already at or past stage "${targetStageId}", skipping`);
-      return;
+  if (priceCents && lines.some(l => l.amountCents === null && l.pct !== null)) {
+    for (const l of lines) {
+      if (l.amountCents === null && l.pct !== null && l.seq !== 1) {
+        l.amountCents = Math.floor((priceCents * l.pct) / 10000) * 100; // whole dollars, rounded down
+        l.filled = true;
+      }
     }
-
-    console.log(`[advanceDealStage] deal ${dealId}: ${dealProps.dealstage} → "${targetStageId}"`);
-    await client.crm.deals.basicApi.update(dealId, {
-      properties: { dealstage: targetStageId },
-    });
-    console.log(`[advanceDealStage] Success`);
-  } catch (err) {
-    console.log(`[advanceDealStage] ERROR: ${err.message}`);
+    const dp = lines.find(l => l.seq === 1);
+    if (dp && dp.amountCents === null && dp.pct !== null) {
+      dp.amountCents = priceCents - lines.filter(l => l !== dp).reduce((s, l) => s + (l.amountCents || 0), 0);
+      dp.filled = true;
+    }
   }
-}
 
-// processedPlans: avoids re-processing the same plan multiple times in one run
-// healthStatusDone: avoids calling updatePaymentHealthStatus more than once per deal per run
-async function processPaymentPlan(client, planId, carryOver, processedPlans, healthStatusDone) {
-  if (processedPlans.has(planId)) return;
-  processedPlans.add(planId);
-
-  const planResp = await client.crm.objects.basicApi.getById(PLAN_OBJ, planId, [
-    'amount_due', 'total_payments_received', 'carried_over_amount',
-    'installment_sequence', 'payment_type', 'hs_pipeline_stage',
-  ]);
-  const props = planResp.properties;
-  const amountDue = num(props.amount_due);
-  if (amountDue <= 0) return;
-
-  const totalReceived  = num(props.total_payments_received);
-  const prevCarry      = num(props.carried_over_amount);
-  const effectiveCarry = carryOver !== null ? carryOver : prevCarry;
-  const effectivePaid  = round(totalReceived + effectiveCarry);
-  const amountPaid     = round(Math.min(effectivePaid, amountDue));
-  const overflow       = round(Math.max(0, effectivePaid - amountDue));
-
-  let newStage;
-  if (amountPaid >= amountDue) newStage = STAGES.PAID;
-  else if (amountPaid > 0)     newStage = STAGES.PARTIALLY_PAID;
-  else                          newStage = STAGES.UNPAID;
-
-  const balanceDue = round(Math.max(0, amountDue - amountPaid));
-
-  const updateProps = {
-    amount_paid: String(amountPaid),
-    balance_due: String(balanceDue),
-    hs_pipeline_stage: newStage,
+  const scheduled = lines.filter(l => (l.amountCents || 0) > 0);
+  let remaining = txnCents;
+  const result = scheduled.map(l => {
+    const paid = Math.min(l.amountCents, Math.max(remaining, 0));
+    remaining -= paid;
+    const balance = l.amountCents - paid;
+    const pastDue = !!l.due_date && String(l.due_date).slice(0, 10) < today;
+    let stage;
+    if (balance === 0) stage = l.seq === 99 ? STAGES.FULL_PAYMENT : STAGES.PAID;
+    else if (pastDue) stage = STAGES.OVERDUE;
+    else if (paid > 0) stage = STAGES.PARTIALLY_PAID;
+    else stage = STAGES.UNPAID;
+    return { id: l.id, seq: l.seq, type: l.payment_type, amountCents: l.amountCents, filled: !!l.filled,
+      paidCents: paid, balanceCents: balance, stage };
+  });
+  if (remaining > 0 && result.length) {
+    const last = result[result.length - 1];
+    last.paidCents += remaining; // keep the real money received on record
+    last.stage = STAGES.OVERPAID;
+  }
+  return {
+    result,
+    unallocatedCents: Math.max(remaining, 0),
+    scheduleTotal: scheduled.reduce((s, l) => s + l.amountCents, 0),
   };
-  if (carryOver !== null) updateProps.carried_over_amount = String(effectiveCarry);
-
-  await client.crm.objects.basicApi.update(PLAN_OBJ, planId, { properties: updateProps });
-
-  const dealAssocs = await assocGet(client, PLAN_OBJ, planId, 'deals');
-  const dealId = dealAssocs[0] ? String(dealAssocs[0].toObjectId) : null;
-
-  await updateDealStatus(client, dealId, props.payment_type, newStage);
-  await advanceDealStage(client, dealId, props.payment_type, newStage);
-
-  // Only call updatePaymentHealthStatus once per deal per run
-  if (dealId && !healthStatusDone.has(dealId)) {
-    healthStatusDone.add(dealId);
-    await updatePaymentHealthStatus(client, dealId);
-  }
-
-  if (overflow > 0 && dealId) {
-    const seq = num(props.installment_sequence);
-    const nextPlan = await findNextPlan(client, planId, seq, dealId);
-    if (nextPlan) await processPaymentPlan(client, nextPlan.id, overflow, processedPlans, healthStatusDone);
-  }
 }
 
-module.exports = async function handler(req, res) {
-  const since  = Date.now() - 20 * 60 * 1000;
-  const client = new hubspot.Client({ accessToken: process.env.HUBSPOT_PRIVATE_APP_TOKEN });
+function dealSummary(result) {
+  if (!result.length) return null;
+  const anyOverdue = result.some(r => r.stage === STAGES.OVERDUE);
+  const allPaid = result.every(r => PAID_STAGES.includes(r.stage));
+  const health = anyOverdue ? 'Overdue - Follow Up' : allPaid ? 'Fully Paid' : 'On Track';
+  const paidLines = result.filter(r => PAID_STAGES.includes(r.stage));
+  const highestPaid = paidLines[paidLines.length - 1];
+  const partial = result.find(r => !PAID_STAGES.includes(r.stage) && r.paidCents > 0);
+  let status = null;
+  if (highestPaid) status = highestPaid.seq === 99 ? 'Full Payment' : `${SEQ_NAME(highestPaid.seq)} Paid`;
+  else if (partial && partial.seq !== 99) status = `${SEQ_NAME(partial.seq)} Partial`;
+  const targetStage = highestPaid ? SEQ_TO_DEAL_STAGE[highestPaid.seq] : null;
+  return { health, status, targetStage };
+}
 
-  const resp = await client.apiRequest({
-    method: 'POST',
-    path: '/crm/v3/objects/p146428886_payment_transactions/search',
-    body: {
-      filterGroups: [{ filters: [{ propertyName: 'hs_lastmodifieddate', operator: 'GTE', value: String(since) }] }],
-      properties: ['id'],
-      limit: 50,
-    },
-  });
-  const body = await resp.json();
-  const ids  = (body.results || []).map(r => r.id);
+// ── HubSpot I/O ──
+async function json(client, method, path, body) {
+  const r = await client.apiRequest({ method, path, body });
+  return r.json();
+}
+async function assocBatch(client, from, to, ids) {
+  const map = {};
+  for (let i = 0; i < ids.length; i += 100) {
+    const b = await json(client, 'POST', `/crm/v4/associations/${from}/${to}/batch/read`,
+      { inputs: ids.slice(i, i + 100).map(id => ({ id: String(id) })) });
+    for (const r of b.results || []) map[String(r.from.id)] = (r.to || []).map(t => String(t.toObjectId));
+  }
+  return map;
+}
+async function batchRead(client, obj, ids, properties) {
+  const out = [];
+  for (let i = 0; i < ids.length; i += 100) {
+    const b = await json(client, 'POST', `/crm/v3/objects/${obj}/batch/read`,
+      { inputs: ids.slice(i, i + 100).map(id => ({ id: String(id) })), properties });
+    out.push(...(b.results || []));
+  }
+  return out;
+}
 
-  if (!ids.length) return res.status(200).json({ status: 'nothing_recent' });
+async function recalcDeal(client, dealId, dry, today) {
+  const [deal] = await batchRead(client, 'deals', [dealId],
+    ['dealname', 'sales_price_usd', 'pipeline', 'dealstage', 'payment_status', 'payment_health_status']);
+  if (!deal) return { dealId, skipped: 'not found' };
+  const dp = deal.properties;
+  const name = (dp.dealname || '').trim();
+  if (dp.pipeline !== BALI_DEAL_PIPELINE) return { dealId, deal: name, skipped: 'not Bali pipeline' };
+  if (SKIP_DEALS.includes(name)) return { dealId, deal: name, skipped: 'test unit' };
 
-  // Shared across all transactions in this run to avoid redundant API calls
-  const processedPlans  = new Set();
-  const healthStatusDone = new Set();
+  const planIds = (await assocBatch(client, 'deals', PLAN_OBJ, [dealId]))[String(dealId)] || [];
+  if (!planIds.length) return { dealId, deal: name, skipped: 'no plans' };
+  const planRecs = await batchRead(client, PLAN_OBJ, planIds, ['payment_type', 'amount_due', 'amount_paid',
+    'balance_due', 'due_date', 'of_purchase_price', 'hs_pipeline', 'hs_pipeline_stage', 'payment_status']);
+  const plans = planRecs.filter(p => p.properties.hs_pipeline === PLAN_PIPELINE).map(p => ({
+    id: String(p.id), payment_type: p.properties.payment_type, due_date: p.properties.due_date,
+    amountCents: toCents(p.properties.amount_due),
+    pct: p.properties.of_purchase_price !== null && p.properties.of_purchase_price !== undefined &&
+      p.properties.of_purchase_price !== '' ? Number(p.properties.of_purchase_price) : null,
+    cur: p.properties,
+  }));
 
-  const results = [];
-  for (const transactionId of ids) {
-    try {
-      const planAssoc = await assocGet(client, TXN_OBJ, transactionId, PLAN_OBJ);
-      if (!planAssoc.length) { results.push({ transactionId, status: 'no_plan' }); continue; }
-      const planId = String(planAssoc[0].toObjectId);
-      await processPaymentPlan(client, planId, null, processedPlans, healthStatusDone);
-      results.push({ transactionId, status: 'success' });
-    } catch (err) {
-      results.push({ transactionId, status: 'error', error: err.message });
+  const txnMap = await assocBatch(client, PLAN_OBJ, TXN_OBJ, plans.map(p => p.id));
+  const txnIds = [...new Set(Object.values(txnMap).flat())];
+  const txns = await batchRead(client, TXN_OBJ, txnIds, ['amount_received']);
+  const txnCents = txns.reduce((s, t) => s + (toCents(t.properties.amount_received) || 0), 0);
+
+  const calc = computeDeal({ priceCents: toCents(dp.sales_price_usd), plans, txnCents, today });
+
+  const planUpdates = [];
+  for (const r of calc.result) {
+    const cur = plans.find(p => p.id === r.id).cur;
+    const props = {};
+    if (r.filled) props.amount_due = fromCents(r.amountCents);
+    if (toCents(cur.amount_paid) !== r.paidCents) props.amount_paid = fromCents(r.paidCents);
+    if (toCents(cur.balance_due) !== r.balanceCents) props.balance_due = fromCents(r.balanceCents);
+    if (cur.hs_pipeline_stage !== r.stage) props.hs_pipeline_stage = r.stage;
+    if (cur.payment_status !== STAGE_LABEL[r.stage]) props.payment_status = STAGE_LABEL[r.stage];
+    if (Object.keys(props).length) {
+      planUpdates.push({ id: r.id, type: r.type,
+        before: { amount_paid: cur.amount_paid, status: cur.payment_status }, properties: props });
     }
   }
 
-  return res.status(200).json({ processed: ids.length, results });
-};
+  const dealProps = {};
+  const sum = dealSummary(calc.result);
+  if (sum) {
+    if (sum.health !== dp.payment_health_status) dealProps.payment_health_status = sum.health;
+    if (sum.status && sum.status !== dp.payment_status) dealProps.payment_status = sum.status;
+    if (sum.targetStage) {
+      const curIdx = BALI_STAGE_ORDER.indexOf(dp.dealstage);
+      const tgtIdx = BALI_STAGE_ORDER.indexOf(sum.targetStage);
+      if (tgtIdx > curIdx) dealProps.dealstage = sum.targetStage; // forward only
+    }
+  }
+
+  if (!dry) {
+    if (planUpdates.length) {
+      await json(client, 'POST', `/crm/v3/objects/${PLAN_OBJ}/batch/update`,
+        { inputs: planUpdates.map(u => ({ id: u.id, properties: u.properties })) });
+    }
+    if (Object.keys(dealProps).length) {
+      await json(client, 'PATCH', `/crm/v3/objects/deals/${dealId}`, { properties: dealProps });
+    }
+  }
+  return {
+    dealId, deal: name, received: fromCents(txnCents), schedule: fromCents(calc.scheduleTotal),
+    price: dp.sales_price_usd, unallocated: fromCents(calc.unallocatedCents), dry: !!dry,
+    planUpdates, dealUpdates: dealProps,
+  };
+}
+
+async function allBaliDeals(client) {
+  const ids = []; let after;
+  do {
+    const b = await json(client, 'POST', '/crm/v3/objects/deals/search', {
+      filterGroups: [{ filters: [{ propertyName: 'pipeline', operator: 'EQ', value: BALI_DEAL_PIPELINE }] }],
+      properties: ['dealname'], limit: 100, ...(after ? { after } : {}),
+    });
+    ids.push(...(b.results || []).map(d => String(d.id)));
+    after = b.paging && b.paging.next && b.paging.next.after;
+  } while (after);
+  return ids;
+}
+
+function baliToday() {
+  return new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10); // UTC+8
+}
+
+async function handler(req, res) {
+  const client = new hubspot.Client({ accessToken: process.env.HUBSPOT_PRIVATE_APP_TOKEN });
+  const today = baliToday();
+  try {
+    if (req.method === 'POST') {
+      // HubSpot webhook — events on Payment Transactions (or Plans)
+      const events = Array.isArray(req.body) ? req.body : [req.body];
+      const ids = [...new Set(events.filter(e => e && e.objectId).map(e => String(e.objectId)))];
+      if (!ids.length) return res.status(200).json({ status: 'no_events' });
+      const txnToPlan = await assocBatch(client, TXN_OBJ, PLAN_OBJ, ids).catch(() => ({}));
+      const planIds = new Set();
+      for (const id of ids) (txnToPlan[id] && txnToPlan[id].length ? txnToPlan[id] : [id]).forEach(p => planIds.add(p));
+      const planToDeal = await assocBatch(client, PLAN_OBJ, 'deals', [...planIds]).catch(() => ({}));
+      const dealIds = [...new Set(Object.values(planToDeal).flat())];
+      const out = [];
+      for (const d of dealIds) {
+        try { const r = await recalcDeal(client, d, false, today); out.push({ deal: r.deal, updated: (r.planUpdates || []).length, skipped: r.skipped }); }
+        catch (err) { out.push({ dealId: d, error: err.message }); }
+      }
+      return res.status(200).json({ deals: out });
+    }
+    if (req.method !== 'GET') return res.status(405).send('Method Not Allowed');
+
+    const q = req.query || {};
+    const wantsDetail = q.dry === '1' || q.deal;
+    if (wantsDetail && (!process.env.CRON_SECRET || req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`)) {
+      return res.status(401).send('Unauthorized');
+    }
+    const dry = q.dry === '1';
+    const ids = q.deal ? [String(q.deal)] : await allBaliDeals(client);
+    const out = [];
+    for (const d of ids) {
+      try { out.push(await recalcDeal(client, d, dry, today)); }
+      catch (err) { out.push({ dealId: d, error: err.message }); }
+    }
+    if (!wantsDetail) {
+      // cron run: counts only, no financial detail in a public response
+      return res.status(200).json({
+        today, deals: out.length,
+        plansUpdated: out.reduce((s, o) => s + ((o.planUpdates || []).length), 0),
+        errors: out.filter(o => o.error).length,
+      });
+    }
+    return res.status(200).json({ today, dry, deals: out });
+  } catch (err) {
+    console.error('[PaymentTracker]', err);
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+module.exports = handler;
+module.exports.computeDeal = computeDeal;
+module.exports.dealSummary = dealSummary;
+module.exports.toCents = toCents;
+module.exports.fromCents = fromCents;
+module.exports.recalcDeal = recalcDeal;
