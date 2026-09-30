@@ -2,7 +2,10 @@
   "version": 2,
   "functions": {
     "api/process-payment.js": {
-      "maxDuration": 30
+      "maxDuration": 60
+    },
+    "api/process-recent.js": {
+      "maxDuration": 300
     }
   }
 }
