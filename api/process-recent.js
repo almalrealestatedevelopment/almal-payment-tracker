@@ -15,7 +15,7 @@
 //   2. Money = ALL Payment Transactions linked to any of the deal's plans.
 //   3. Cascade: Downpayment first, then Installment 1, 2, ... each takes
 //      what it needs before the next gets anything.
-//   4. Writes Amount Paid, Balance Due, stage + Payment Status on each plan
+//   4. Writes Amount Paid, Balance Due (+ Legacy), stage + Payment Status on each plan
 //      (HubSpot workflows then copy them to the deal) and the deal's
 //      Payment Health Status, payment_status and deal stage (forward only).
 //
@@ -183,7 +183,7 @@ async function recalcDeal(client, dealId, dry, today) {
   const planIds = (await assocBatch(client, 'deals', PLAN_OBJ, [dealId]))[String(dealId)] || [];
   if (!planIds.length) return { dealId, deal: name, skipped: 'no plans' };
   const planRecs = await batchRead(client, PLAN_OBJ, planIds, ['payment_type', 'amount_due', 'amount_paid',
-    'balance_due', 'due_date', 'of_purchase_price', 'hs_pipeline', 'hs_pipeline_stage', 'payment_status']);
+    'balance_due', 'balance_due_calc', 'due_date', 'of_purchase_price', 'hs_pipeline', 'hs_pipeline_stage', 'payment_status']);
   const plans = planRecs.filter(p => p.properties.hs_pipeline === PLAN_PIPELINE).map(p => ({
     id: String(p.id), payment_type: p.properties.payment_type, due_date: p.properties.due_date,
     amountCents: toCents(p.properties.amount_due),
@@ -206,6 +206,9 @@ async function recalcDeal(client, dealId, dry, today) {
     if (r.filled) props.amount_due = fromCents(r.amountCents);
     if (toCents(cur.amount_paid) !== r.paidCents) props.amount_paid = fromCents(r.paidCents);
     if (toCents(cur.balance_due) !== r.balanceCents) props.balance_due = fromCents(r.balanceCents);
+    // "Balance Due" (balance_due_calc) is what the record card, SOA app and Sales Documents read.
+    // Legacy balance_due is still written because the Payment Management → Deals workflow copies it.
+    if (toCents(cur.balance_due_calc) !== r.balanceCents) props.balance_due_calc = fromCents(r.balanceCents);
     if (cur.hs_pipeline_stage !== r.stage) props.hs_pipeline_stage = r.stage;
     if (cur.payment_status !== STAGE_LABEL[r.stage]) props.payment_status = STAGE_LABEL[r.stage];
     if (Object.keys(props).length) {
