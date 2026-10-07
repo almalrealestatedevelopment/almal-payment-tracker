@@ -206,9 +206,7 @@ async function recalcDeal(client, dealId, dry, today) {
     if (r.filled) props.amount_due = fromCents(r.amountCents);
     if (toCents(cur.amount_paid) !== r.paidCents) props.amount_paid = fromCents(r.paidCents);
     if (toCents(cur.balance_due) !== r.balanceCents) props.balance_due = fromCents(r.balanceCents);
-    // "Balance Due" (balance_due_calc) is what the record card, SOA app and Sales Documents read.
-    // Legacy balance_due is still written because the Payment Management → Deals workflow copies it.
-    if (toCents(cur.balance_due_calc) !== r.balanceCents) props.balance_due_calc = fromCents(r.balanceCents);
+    // Note: "Balance Due" (balance_due_calc) is a HubSpot calculation property (read-only) — never write it here.
     if (cur.hs_pipeline_stage !== r.stage) props.hs_pipeline_stage = r.stage;
     if (cur.payment_status !== STAGE_LABEL[r.stage]) props.payment_status = STAGE_LABEL[r.stage];
     if (Object.keys(props).length) {
